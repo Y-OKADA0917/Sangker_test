@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>Sangker Basin – Rain + Time Series</title>
+
+<!-- MapLibre -->
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.css">
+<script src="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.js"></script>
+
+<!-- turf -->
+<script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
+
+<!-- Chart.js -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<style>
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+
+/* ===== layout ===== */
+#layout {
+  display: flex;
+  height: 100%;
+  width: 100%;
+}
+
+/* ===== map panel ===== */
+#map-panel {
+  flex: 2;
+  position: relative;
+}
+#map {
+  position: absolute;
+  inset: 0;
+}
+
+/* ===== right chart panel ===== */
+#chart-panel {
+  flex: 1;
+  min-width: 320px;
+  border-left: 1px solid #ccc;
+  display: flex;
+  flex-direction: column;
+  font-family: system-ui, sans-serif;
+}
+
+.chart-block {
+  flex: 1;
+  min-height: 0;
+  padding: 6px;
+  border-bottom: 1px solid #ddd;
+  display: flex;
+  flex-direction: column;
+}
+.chart-block:last-child {
+  border-bottom: none;
+}
+.chart-title {
+  font-size: 13px;
+  font-weight: bold;
+  margin-bottom: 4px;
+}
+.chart-container {
+  flex: 1;
+  position: relative;
+}
+canvas {
+  width: 100% !important;
+  height: 100% !important;
+}
+
+/* ===== basemap switcher ===== */
+#basemap-switcher {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 10;
+  background: rgba(255,255,255,0.9);
+  padding: 6px 10px;
+  border-radius: 4px;
+  font-size: 12px;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+}
+#basemap-switcher label {
+  display: block;
+  cursor: pointer;
+}
+
+/* ===== rain slider ===== */
+#slider-box {
+  position: absolute;
+  bottom: 15px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10;
+  background: rgba(255,255,255,0.9);
+  padding: 8px 14px;
+  border-radius: 6px;
+  font-family: sans-serif;
+  font-size: 13px;
+}
+</style>
+</head>
+
+<body>
+
+<div id="layout">
+
+  <!-- ===== map ===== -->
+  <div id="map-panel">
+    <div id="map"></div>
+
+    <div id="basemap-switcher">
+      <strong>Basemap</strong>
+      <label><input type="radio" name="basemap" value="osm" checked> OSM</label>
+      <label><input type="radio" name="basemap" value="satellite"> Satellite</label>
+      <label><input type="radio" name="basemap" value="hybrid"> Hybrid</label>
+    </div>
+
+    <div id="slider-box">
+      <label style="margin-right:10px;">
+        <input type="checkbox" id="rainToggle" checked>
+        Rainfall
+      </label>
+      <input id="slider" type="range" min="0" max="0" step="1" value="0">
+      <span id="label"></span>
+    </div>
+  </div>
+
+  <!-- ===== charts ===== -->
+  <div id="chart-panel">
+    <div class="chart-block">
+      <div class="chart-title">Bac Prea</div>
+      <div class="chart-container"><canvas id="chart1"></canvas></div>
+    </div>
+    <div class="chart-block">
+      <div class="chart-title">Battambang</div>
+      <div class="chart-container"><canvas id="chart2"></canvas></div>
+    </div>
+    <div class="chart-block">
+      <div class="chart-title">Sek Sork Dam</div>
+      <div class="chart-container"><canvas id="chart3"></canvas></div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+/* ==========================
+   Rain images
+========================== */
+const rainImages = [
+  "imgs/FL_gsmap_mvk@Sangker.2022092018.png",
+  "imgs/FL_gsmap_mvk@Sangker.2022092019.png",
+  "imgs/FL_gsmap_mvk@Sangker.2022092020.png",
+  "imgs/FL_gsmap_mvk@Sangker.2022092021.png",
+  "imgs/FL_gsmap_mvk@Sangker.2022092022.png",
+  "imgs/FL_gsmap_mvk@Sangker.2022092023.png",
+  "imgs/FL_gsmap_mvk@Sangker.2022092100.png"
+];
+
+const timeLabels = [
+  "2022-09-20 18:00",
+  "2022-09-20 19:00",
+  "2022-09-20 20:00",
+  "2022-09-20 21:00",
+  "2022-09-20 22:00",
+  "2022-09-20 23:00",
+  "2022-09-21 00:00"
+];
+
+const imageCoordinates = [
+  [98,17],[110,17],[110,9],[98,9]
+];
+
+/* ==========================
+   Map
+========================== */
+const map = new maplibregl.Map({
+  container: "map",
+  style: {
+    version: 8,
+    sources: {
+      osm: {
+        type: "raster",
+        tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+        tileSize: 256
+      },
+      esri_imagery: {
+        type: "raster",
+        tiles: ["https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"],
+        tileSize: 256
+      },
+      esri_street: {
+        type: "raster",
+        tiles: ["https://services.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}"],
+        tileSize: 256
+      }
+    },
+    layers: [
+      { id:"osm", type:"raster", source:"osm" },
+      { id:"satellite", type:"raster", source:"esri_imagery", layout:{visibility:"none"} },
+      { id:"hybrid-street", type:"raster", source:"esri_street", layout:{visibility:"none"} }
+    ]
+  },
+  center: [104,13],
+  zoom: 6.8
+});
+
+map.addControl(new maplibregl.NavigationControl(), "top-left");
+
+function setBasemap(mode) {
+  map.setLayoutProperty("osm","visibility", mode==="osm"?"visible":"none");
+  map.setLayoutProperty("satellite","visibility", mode==="satellite"?"visible":"none");
+  map.setLayoutProperty("hybrid-street","visibility", mode==="hybrid"?"visible":"none");
+}
+document.querySelectorAll('input[name="basemap"]').forEach(el =>
+  el.addEventListener("change", e => setBasemap(e.target.value))
+);
+
+/* ==========================
+   Layers
+========================== */
+map.on("load", () => {
+
+  map.addSource("rain", {
+    type:"image",
+    url: rainImages[0],
+    coordinates: imageCoordinates
+  });
+  map.addLayer({
+    id:"rain-layer",
+    type:"raster",
+    source:"rain",
+    paint:{
+      "raster-opacity":0.5,
+      "raster-resampling":"nearest"
+    }
+  });
+
+  fetch("Sangke_river_epsg4326.geojson")
+    .then(r=>r.json())
+    .then(g=>{
+      map.addSource("basin",{type:"geojson",data:g});
+      map.addLayer({id:"basin-fill",type:"fill",source:"basin",
+        paint:{ "fill-color":"#ff8800","fill-opacity":0.2 }});
+      map.addLayer({id:"basin-line",type:"line",source:"basin",
+        paint:{ "line-color":"#ff0000","line-width":2 }});
+    });
+
+  fetch("riv_Sangker_r1.geojson")
+    .then(r=>r.json())
+    .then(riv=>{
+      map.addSource("river",{type:"geojson",data:riv});
+      map.addLayer({id:"river-line",type:"line",source:"river",
+        paint:{ "line-color":"#0066ff","line-width":2.5 }});
+    });
+
+  fetch("location.geojson")
+    .then(r=>r.json())
+    .then(loc=>{
+      map.addSource("locations",{type:"geojson",data:loc});
+      map.addLayer({
+        id:"locations-point",
+        type:"circle",
+        source:"locations",
+        paint:{
+          "circle-radius":6,
+          "circle-color":"#ffcc00",
+          "circle-stroke-color":"#333",
+          "circle-stroke-width":1.4
+        }
+      });
+
+      const popup = new maplibregl.Popup({closeButton:false,closeOnClick:false});
+      map.on("mousemove","locations-point",e=>{
+        popup.setLngLat(e.lngLat)
+             .setHTML(`<strong>${e.features[0].properties.Name}</strong>`)
+             .addTo(map);
+      });
+      map.on("mouseleave","locations-point",()=>popup.remove());
+    });
+});
+
+/* ==========================
+   Slider
+========================== */
+const slider = document.getElementById("slider");
+const label  = document.getElementById("label");
+slider.max = rainImages.length-1;
+label.textContent = timeLabels[0];
+
+slider.addEventListener("input",()=>{
+  const t = Number(slider.value);
+  map.getSource("rain").updateImage({url:rainImages[t]});
+  label.textContent = timeLabels[t];
+});
+
+document.getElementById("rainToggle")
+  .addEventListener("change",e=>{
+    map.setLayoutProperty(
+      "rain-layer","visibility",
+      e.target.checked?"visible":"none"
+    );
+  });
+
+/* ==========================
+   Charts (from r8)
+========================== */
+function loadWL(file){
+  return fetch(file).then(r=>r.text()).then(t=>{
+    const l=t.trim().split(/\r?\n/);
+    return {
+      labels:l.map(x=>x.split(/\s+/)[0]),
+      values:l.map(x=>parseFloat(x.split(/\s+/)[1]))
+    };
+  });
+}
+
+function makeChart(id,lbl,val){
+  return new Chart(document.getElementById(id),{
+    type:"line",
+    data:{labels:lbl,datasets:[{data:val,borderWidth:1.3,pointRadius:0}]},
+    options:{responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{display:false}}}
+  });
+}
+
+Promise.all([
+  loadWL("ymdh_wl_Bac_Prea.txt"),
+  loadWL("ymdh_wl_Battambang.txt"),
+  loadWL("ymdh_wl_Sek-sok_Dam.txt")
+]).then(([a,b,c])=>{
+  makeChart("chart1",a.labels,a.values);
+  makeChart("chart2",b.labels,b.values);
+  makeChart("chart3",c.labels,c.values);
+});
+</script>
+
+</body>
+</html>
