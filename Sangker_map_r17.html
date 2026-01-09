@@ -1,0 +1,587 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>Sangker River Basin 2022 Flood Analysis</title>
+
+<!-- MapLibre -->
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.css">
+<script src="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.js"></script>
+
+<!-- turf -->
+<script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
+
+<!-- Chart.js -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<style>
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+
+/* ===== layout ===== */
+#layout {
+  display: flex;
+  height: 100%;
+  width: 100%;
+}
+
+/* ===== map panel ===== */
+#map-panel {
+  flex: 2;
+  position: relative;
+}
+#map {
+  position: absolute;
+  inset: 0;
+}
+
+/* ===== right chart panel ===== */
+#chart-panel {
+  flex: 0.8;
+  min-width: 380px;
+  border-left: 1px solid #ccc;
+  display: flex;
+  flex-direction: column;
+  font-family: system-ui, sans-serif;
+}
+
+.chart-block {
+  flex: 1;
+  min-height: 0;
+  padding: 6px;
+  border-bottom: 1px solid #ddd;
+  display: flex;
+  flex-direction: column;
+}
+.chart-block:last-child {
+  border-bottom: none;
+}
+.chart-title {
+  font-size: 13px;
+  font-weight: bold;
+  margin-bottom: 4px;
+}
+.chart-container {
+  flex: 1;
+  position: relative;
+}
+canvas {
+  width: 100% !important;
+  height: 100% !important;
+}
+
+.chart-block-large {
+  flex: 1.35; /* give Sek Sak Dam a bit more height so x-axis labels are visible */
+}
+
+/* ===== basemap switcher ===== */
+#basemap-switcher {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 10;
+  background: rgba(255,255,255,0.9);
+  padding: 6px 10px;
+  border-radius: 4px;
+  font-size: 12px;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+}
+#basemap-switcher label {
+  display: block;
+  cursor: pointer;
+}
+
+/* ===== rain slider ===== */
+#slider-box {
+  position: absolute;
+  bottom: 15px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10;
+  background: rgba(255,255,255,0.9);
+  padding: 8px 14px;
+  border-radius: 6px;
+  font-family: sans-serif;
+  font-size: 13px;
+}
+</style>
+</head>
+
+<body>
+
+<div id="layout">
+
+  <!-- ===== map ===== -->
+  <div id="map-panel">
+    <div id="map"></div>
+
+    <div id="basemap-switcher">
+      <strong>Basemap</strong>
+      <label><input type="radio" name="basemap" value="osm" checked> OSM</label>
+      <label><input type="radio" name="basemap" value="satellite"> Satellite</label>
+      <label><input type="radio" name="basemap" value="hybrid"> Hybrid</label>
+    </div>
+
+    <div id="slider-box">
+      <label style="margin-right:10px;">
+        <input type="checkbox" id="rainToggle" checked>
+        Rainfall
+      </label>
+      <input id="slider" type="range" min="0" max="0" step="1" value="0">
+      <span id="label"></span>
+    </div>
+  </div>
+
+  <!-- ===== charts ===== -->
+  <div id="chart-panel">
+    <div class="chart-block">
+      <div class="chart-title">Salata_Orn_Weir</div>
+      <div class="chart-container"><canvas id="chart1"></canvas></div>
+    </div>
+    <div class="chart-block">
+      <div class="chart-title">Battambang Provincial Hall</div>
+      <div class="chart-container"><canvas id="chart2"></canvas></div>
+    </div>
+    <div class="chart-block chart-block-large">
+      <div class="chart-title">Sek Sak Dam</div>
+      <div class="chart-container"><canvas id="chart3"></canvas></div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+/* ==========================
+   Rain images (externalizable)
+   - Put only the "time range / png naming" in an external JSON file.
+   - Default reads: rain_spec.json (recommended)
+   - Optional reads: rain_manifest.json (explicit list)
+========================== */
+
+function pad2(n){ return String(n).padStart(2,"0"); }
+
+function codeYmdh(dt){
+  return `${dt.getFullYear()}${pad2(dt.getMonth()+1)}${pad2(dt.getDate())}${pad2(dt.getHours())}`;
+}
+
+function labelYmdhm(dt){
+  return `${dt.getFullYear()}-${pad2(dt.getMonth()+1)}-${pad2(dt.getDate())} ${pad2(dt.getHours())}:00`;
+}
+
+function parseStart(start){
+  // start can be {y,m,d,h} or ISO string like "2022-09-20T18:00:00"
+  if(!start) return new Date();
+  if(typeof start === "string"){
+    // local time interpretation (if timezone offset is included in the string, JS will respect it)
+    return new Date(start);
+  }
+  if(typeof start === "object"){
+    return new Date(start.y, (start.m||1)-1, start.d||1, start.h||0, 0, 0);
+  }
+  return new Date();
+}
+
+function buildRainSeriesFromSpec(spec){
+  // spec: {prefix,suffix,start,hours,stepHours,end}
+  const start = parseStart(spec.start);
+  const stepHours = Number(spec.stepHours || 1);
+  let n = Number(spec.hours || 0);
+
+  if(!n && spec.end){
+    const end = parseStart(spec.end);
+    const diffH = Math.max(0, Math.round((end.getTime() - start.getTime()) / 3600_000));
+    n = Math.floor(diffH / stepHours) + 1; // inclusive
+  }
+  if(!n) n = 1;
+
+  const images = [];
+  const labels = [];
+  for(let i=0;i<n;i++){
+    const dt = new Date(start.getTime() + i*stepHours*3600_000);
+    const code = codeYmdh(dt);
+    images.push(`${spec.prefix}${code}${spec.suffix}`);
+    labels.push(labelYmdhm(dt));
+  }
+  return { images, labels };
+}
+
+function normalizeRainManifest(data){
+  // Accept:
+  // 1) ["imgs/a.png", "imgs/b.png", ...]
+  // 2) [{"url":"imgs/a.png","label":"2022-09-20 18:00"}, ...]
+  // 3) {"manifest":[...]}  (same as 1 or 2)
+  if(Array.isArray(data)){
+    if(data.length === 0) return { images: [], labels: [] };
+    if(typeof data[0] === "string"){
+      return { images: data, labels: data.map((_,i)=>`#${i+1}`) };
+    }
+    return {
+      images: data.map(x=>x.url),
+      labels: data.map(x=>x.label || x.url || "")
+    };
+  }
+  if(data && Array.isArray(data.manifest)){
+    return normalizeRainManifest(data.manifest);
+  }
+  return null;
+}
+
+/* ---- Placeholder (so the map can start even if JSON is missing) ---- */
+let rainImages = ["imgs/FL_gsmap_mvk@Sangker.2022092018.png"];
+let timeLabels = ["(loading...)"];
+let pendingRainUrl = null;
+
+/* ---- Load external file (recommended: rain_spec.json) ---- */
+async function loadRainSeries(){
+  // Fallback spec (same logic as r16)
+  const fallbackSpec = {
+    prefix: "imgs/FL_gsmap_mvk@Sangker.",
+    suffix: ".png",
+    start: { y: 2022, m: 9, d: 20, h: 18 },
+    hours: 22,
+    stepHours: 1
+  };
+
+  let loaded = null;
+
+  // Try rain_spec.json first (spec-based; best for long periods like ~1 month)
+  try{
+    const r = await fetch("rain_spec.json", {cache:"no-store"});
+    if(r.ok){
+      const spec = await r.json();
+      // If the file is actually a manifest, still accept it
+      loaded = normalizeRainManifest(spec) || buildRainSeriesFromSpec(spec);
+    }
+  }catch(e){
+    // ignore
+  }
+
+  // If not found, try rain_manifest.json (explicit list)
+  if(!loaded){
+    try{
+      const r = await fetch("rain_manifest.json", {cache:"no-store"});
+      if(r.ok){
+        const mani = await r.json();
+        loaded = normalizeRainManifest(mani);
+      }
+    }catch(e){
+      // ignore
+    }
+  }
+
+  // If still not loaded, use fallback
+  if(!loaded){
+    loaded = buildRainSeriesFromSpec(fallbackSpec);
+  }
+
+  if(!loaded.images || loaded.images.length === 0){
+    loaded = buildRainSeriesFromSpec(fallbackSpec);
+  }
+
+  rainImages = loaded.images;
+  timeLabels = loaded.labels;
+
+  // Update UI
+  const slider = document.getElementById("slider");
+  const label  = document.getElementById("label");
+  slider.max = Math.max(0, rainImages.length-1);
+  slider.value = 0;
+  label.textContent = timeLabels[0] || "";
+  slider.disabled = false;
+
+  // Update map source if ready
+  const firstUrl = rainImages[0];
+  if(window.map && window.map.getSource && window.map.getSource("rain")){
+    window.map.getSource("rain").updateImage({url:firstUrl});
+  }else{
+    pendingRainUrl = firstUrl;
+  }
+}
+
+const imageCoordinates =
+ [
+  [98,17],[110,17],[110,9],[98,9]
+];
+
+/* ==========================
+   Map
+========================== */
+window.map = new maplibregl.Map({
+  container: "map",
+  style: {
+    version: 8,
+    sources: {
+      osm: {
+        type: "raster",
+        tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+        tileSize: 256
+      },
+      esri_imagery: {
+        type: "raster",
+        tiles: ["https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"],
+        tileSize: 256
+      },
+      esri_street: {
+        type: "raster",
+        tiles: ["https://services.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}"],
+        tileSize: 256
+      }
+    },
+    layers: [
+      { id:"osm", type:"raster", source:"osm" },
+      { id:"satellite", type:"raster", source:"esri_imagery", layout:{visibility:"none"} },
+      { id:"hybrid-street", type:"raster", source:"esri_street", layout:{visibility:"none"} }
+    ]
+  },
+  center: [104,13],
+  zoom: 6.8
+});
+
+map.addControl(new maplibregl.NavigationControl(), "top-left");
+
+function setBasemap(mode) {
+  map.setLayoutProperty("osm","visibility", mode==="osm"?"visible":"none");
+  map.setLayoutProperty("satellite","visibility", mode==="satellite"?"visible":"none");
+  map.setLayoutProperty("hybrid-street","visibility", mode==="hybrid"?"visible":"none");
+}
+document.querySelectorAll('input[name="basemap"]').forEach(el =>
+  el.addEventListener("change", e => setBasemap(e.target.value))
+);
+
+/* ==========================
+   Layers
+========================== */
+map.on("load", () => {
+
+  map.addSource("rain", {
+    type:"image",
+    url: rainImages[0],
+    coordinates: imageCoordinates
+  });
+  map.addLayer({
+  id:"rain-layer",
+  type:"raster",
+  source:"rain",
+  paint:{
+    "raster-opacity":0.5,
+    "raster-resampling":"nearest"
+  }
+});
+
+// If rain list was loaded before map was ready, apply the first image now.
+if(pendingRainUrl){
+  map.getSource("rain").updateImage({url:pendingRainUrl});
+  pendingRainUrl = null;
+}
+
+  fetch("Sangke_river_epsg4326.geojson")
+    .then(r=>r.json())
+    .then(g=>{
+      map.addSource("basin",{type:"geojson",data:g});
+      map.addLayer({id:"basin-fill",type:"fill",source:"basin",
+        paint:{ "fill-color":"#ff8800","fill-opacity":0.2 }});
+      map.addLayer({id:"basin-line",type:"line",source:"basin",
+        paint:{ "line-color":"#ff0000","line-width":2 }});
+    });
+
+  fetch("riv_Sangker_r1.geojson")
+    .then(r=>r.json())
+    .then(riv=>{
+      map.addSource("river",{type:"geojson",data:riv});
+      map.addLayer({id:"river-line",type:"line",source:"river",
+        paint:{ "line-color":"#0066ff","line-width":2.5 }});
+    });
+
+  fetch("location.geojson")
+    .then(r=>r.json())
+    .then(loc=>{
+      map.addSource("locations",{type:"geojson",data:loc});
+      map.addLayer({
+        id:"locations-point",
+        type:"circle",
+        source:"locations",
+        paint:{
+          "circle-radius":6,
+          "circle-color":"#ffcc00",
+          "circle-stroke-color":"#333",
+          "circle-stroke-width":1.4
+        }
+      });
+
+      const popup = new maplibregl.Popup({closeButton:false,closeOnClick:false});
+      map.on("mousemove","locations-point",e=>{
+        popup.setLngLat(e.lngLat)
+             .setHTML(`<strong>${e.features[0].properties.Name}</strong>`)
+             .addTo(map);
+      });
+      map.on("mouseleave","locations-point",()=>popup.remove());
+    });
+});
+
+/* ==========================
+   Slider
+========================== */
+const slider = document.getElementById("slider");
+const label  = document.getElementById("label");
+slider.max = rainImages.length-1;
+slider.disabled = true;
+label.textContent = timeLabels[0];
+
+// Load external rain timeline (rain_spec.json / rain_manifest.json)
+loadRainSeries();
+
+slider.addEventListener("input",()=>{
+  if(!window.map || !window.map.getSource || !window.map.getSource("rain")) return;
+  const t = Number(slider.value);
+  map.getSource("rain").updateImage({url:rainImages[t]});
+  label.textContent = timeLabels[t];
+});
+
+document.getElementById("rainToggle")
+  .addEventListener("change",e=>{
+    map.setLayoutProperty(
+      "rain-layer","visibility",
+      e.target.checked?"visible":"none"
+    );
+  });
+
+/* ==========================
+   Charts (from r8)
+========================== */
+function loadWL(file){
+  return fetch(file).then(r=>r.text()).then(t=>{
+    const l=t.trim().split(/\r?\n/);
+    return {
+      labels:l.map(x=>x.split(/\s+/)[0]),
+      values:l.map(x=>parseFloat(x.split(/\s+/)[1]))
+    };
+  });
+}
+
+function formatMD(s){
+  if(!s) return s;
+  // e.g. 2024010100, 2024-01-01, 2024/01/01, 2024-01-01T00:00
+  const m1 = s.match(/^(\d{4})(\d{2})(\d{2})/); // YYYYMMDD...
+  if(m1) return `${m1[2]}/${m1[3]}`;
+  const m2 = s.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})/); // YYYY-MM-DD or YYYY/MM/DD
+  if(m2) return `${String(m2[2]).padStart(2,'0')}/${String(m2[3]).padStart(2,'0')}`;
+  return s;
+}
+
+function makeChart(id,lbl,val,threshold){
+  const hasThreshold = (typeof threshold === "number");
+
+  // ---- Build datasets ----
+  const datasets = [
+    {
+      label:"Water Level",
+      data:val,
+      borderColor:"#111",
+      borderWidth:1.8,
+      pointRadius:0,
+      tension:0
+    }
+  ];
+
+  if(hasThreshold){
+    datasets.push({
+      label:`Flood Warning Level (EL. ${threshold} m)`,
+      data: val.map(()=>threshold),
+      borderColor:"purple",
+      borderWidth:2.0,
+      pointRadius:0,
+      tension:0
+      // solid line (no dash)
+    });
+  }
+
+  // ---- X-axis tick label control (show MM/DD only, reduce clutter) ----
+  function ymdKey(s){
+    if(!s) return "";
+    // YYYYMMDDHH... or YYYYMMDD...
+    const m1 = s.match(/^(\d{4})(\d{2})(\d{2})/);
+    if(m1) return `${m1[1]}-${m1[2]}-${m1[3]}`;
+    // YYYY-MM-DD... or YYYY/MM/DD...
+    const m2 = s.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})/);
+    if(m2) return `${m2[1]}-${String(m2[2]).padStart(2,'0')}-${String(m2[3]).padStart(2,'0')}`;
+    return s;
+  }
+
+  const keys = lbl.map(ymdKey);
+  const firstOfDay = new Array(lbl.length).fill(false);
+  const dayNo = new Array(lbl.length).fill(0);
+  let d = -1;
+  for(let i=0;i<keys.length;i++){
+    if(i===0 || keys[i] !== keys[i-1]){
+      d += 1;
+      firstOfDay[i] = true;
+    }
+    dayNo[i] = d;
+  }
+  const totalDays = d + 1;
+  const stepDays = Math.max(1, Math.ceil(totalDays / 8)); // aim ~8 labels
+
+  // ---- Y-axis range (ensure threshold is visible) ----
+  const ymax = Math.max(...val, hasThreshold ? threshold : -Infinity);
+  const yMaxFixed = Math.ceil((ymax + 0.5) * 10) / 10;
+
+  return new Chart(document.getElementById(id),{
+    type:"line",
+    data:{labels:lbl,datasets},
+    options:{
+      responsive:true,
+      maintainAspectRatio:false,
+      layout:{ padding:{ bottom: 12, left: 6, right: 6 } },
+      plugins:{
+        legend:{display:hasThreshold}
+      },
+      scales:{
+        x:{
+          ticks:{
+            color:"#111",
+            autoSkip:false,
+            maxRotation:0,
+            minRotation:0,
+            font:{size:9},
+            callback:function(value, index){
+              const raw = this.getLabelForValue(value);
+
+              // Always show the first label so Sek Sak (or any short period) never becomes blank.
+              if(index === 0) return formatMD(raw);
+
+              // show only the first tick of every N days
+              if(!firstOfDay[index]) return "";
+              if((dayNo[index] % stepDays) !== 0) return "";
+              return formatMD(raw); // MM/DD
+            }
+          }
+        },
+        y:{
+          title:{display:true,text:"EL.(m)"},
+          ticks:{color:"#111", font:{size:10}},
+          max: yMaxFixed
+        }
+      }
+    }
+  });
+}
+
+
+Promise.all([
+  loadWL("ymdh_wl_Bac_Prea.txt"),
+  loadWL("ymdh_wl_Battambang.txt"),
+  loadWL("TWLV_2022.dat")
+]).then(([a,b,c])=>{
+  makeChart("chart1",a.labels,a.values,13.5);
+  makeChart("chart2",b.labels,b.values,13.5);
+  makeChart("chart3",c.labels,c.values);
+});
+</script>
+
+</body>
+</html>
